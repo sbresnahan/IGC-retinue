@@ -1,0 +1,575 @@
+---
+title: "Evaluating Intragenomic Conflict in the Altruistic, Pheromone-Mediated Retinue Behavior in Honey Bees: parent-specific gene expression analysis"
+author: "Sean Bresnahan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 1
+editor_options: 
+  chunk_output_type: console
+---
+
+F1 Read counts and BED files of F0 variants are imported.
+
+SNPs intersecting $n > 2$ genes, $n = 2$ genes annotated 
+on the same strand, or within mitochondrial, miRNA, or tRNA genes are discarded.
+
+SNPs with $n < 10$ read counts in any cross; SNPs where the distance between 
+the nearest SNP is shorter than the average read length (thus the read counts 
+are exactly the same for both SNPs), and genes with $n < 2$ SNPs are discarded.
+
+For each SNP, a Storer-Kim binomial exact test of two proportions is conducted 
+to test the hypothesis that the proportion of maternal read counts is 
+significantly different from the proportion of paternal read counts.
+
+Previously established cutoffs for p1 (the proportion of "A" allele counts in 
+individuals from the "BxA" cross) and p2 (the proportion of "A" allele counts 
+in individuals from the "AxB" cross) are required for a gene to be considered 
+as showing parent or lineage biased.
+
+A GLIMMIX model [lmer(count\~parent∗lineage+(1\|SNP)+(1\|individual))] is fit 
+for each gene to assess the effects of parent, lineage, and their interaction, 
+on the quantity of read counts at each SNP. Genes exhibiting significant 
+parent∗lineage effects are considered unbiased. 
+
+For a gene to be considered as showing parent or lineage biases, all SNPs 
+are required to exhibit the same directional bias in both tests.
+
+This analysis utilizes several custom functions. [See here for documentation.](https://github.com/sbresnahan/IGC-retinue/blob/main/PSGE_functions.R)
+
+# Requirements
+
+```{r,message=F}
+# Packages
+library(tidyverse)
+library(plyr)
+library(Rfast)
+library(tryCatchLog)
+library(lmerTest)
+library(car)
+library(viridis)
+library(gridExtra)
+library(kableExtra)
+library(doParallel)
+library(gghalves)
+library(ggdist)
+library(ggpubr)
+library(grid)
+library(DESeq2)
+
+# Custom functions
+source("PSGE_functions.R")
+```
+
+# LB11xW4
+
+### Sample metadata
+
+```{r}
+metadata <- read.csv("metadata.csv")
+metadata <- metadata[metadata$block=="LB11xW4",]
+kbl(metadata) %>% kable_styling()
+```
+
+### Generate SNP:gene read coverage matrix
+
+#### Filter SNPs [`filter_SNPs`]
+1) Filter SNPs that overlap > 2 genes
+2) Filter SNPs overlapping 2 genes on the same strand
+3) Filter SNPs within miRNA/tRNA genes
+
+```{r, eval=F}
+filterlist <- read.csv("miRNA_tRNA_genes.csv",header=F)[,c(1)]
+SNPs <- filter_SNPs("LB11xW4_SNPs_for_analysis_sorted.bed",filterlist,2)
+write.table(SNPs,"LB11xW4_SNP_gene_overlaps.txt",sep="\t",quote=F,row.names=F)
+SNPs <- SNPs[,c(3,4)]
+```
+
+#### Combine coverage files to single matrix [`make_ASE_counts_matrix`]
+
+1)  Create empty data frame `SNP_counts` with as many rows as SNP:genes.
+2)  Create a list of all `*.txt` files in the `counts_SNPs` directory.
+3)  For each file listed in `files.counts`:
+-   Store the sample ID (lineParent_SRA) from the file name to `tmp.name`.
+-   Check if the lineage of the sample is in `metadata$lineage`.
+-   If so, read in the file to `tmp`, keep columns 4 (SNP:gene) and 7 (counts).
+-   Store the sample ID (lineParent_SRA) from the file name to `tmp.name`.
+-   Set column names of `tmp` to column 1 (SNP:gene) and column 2 (`tmp.name`).
+-   Left join `tmp` to `SNP_counts`.
+4)  Set the row names of `SNP_counts` to the SNP:gene IDs stored in column 1
+5)  Remove column 1 (SNP:gene).
+6)  Fill empty cells with 0.
+7)  Remove genes with duplicate rows (where counts are the same in each sample).
+8)  Save as CSV.
+
+```{r,eval=F}
+SNP_counts <- make_ASE_counts_matrix("counts",metadata,2)
+write.csv(SNP_counts,"LB11xW4_SNP_gene_counts.csv")
+```
+
+## Normalize counts by library size [`normalizeASReadCounts`]
+1) Merge allelic counts by library
+2) Estimate library size factors using the median of ratios normalization method from DESeq2
+3) Normalize counts for each library by allele
+
+```{r,eval=F}
+SNP_counts_normalized <- normalizeASReadCounts(SNP_counts[,1:24],metadata)
+write.csv(SNP_counts_normalized,"LB11xW4_SNP_gene_counts_normalized.csv")
+SNP_counts <- SNP_counts_normalized
+rm(SNP_counts_normalized)
+```
+
+### Process count matrices for each phenotype
+
+#### Split counts matrix by phenotype
+
+```{r, eval=F}
+unresponsive.IDs <- metadata[metadata$phenotype=="unresponsive","sample.id"]
+responsive.IDs <- metadata[metadata$phenotype=="responsive","sample.id"]
+
+unresponsive_counts <- SNP_counts[,names(SNP_counts)%in%unresponsive.IDs]
+responsive_counts <- SNP_counts[,names(SNP_counts)%in%responsive.IDs]
+```
+
+#### Filter low-count SNPs from count matrix [`filter_counts`]
+
+1) Remove rows with 0 counts by cross
+2) Flag rows with > 10000 read counts (we run an optimized version of the binomial exact test on these rows, as the binom.test function cannot handle counts > 10000)
+3) Remove genes with < 2 SNPs after steps 1 and 2
+
+```{r, eval=F}
+unresponsive_counts <- filter_counts(unresponsive_counts,metadata,9)
+write.csv(unresponsive_counts,"LB11xW4_unresponsive_counts.csv")
+responsive_counts <- filter_counts(responsive_counts,metadata,9)
+write.csv(responsive_counts,"LB11xW4_responsive_counts.csv")
+```
+
+### Conduct statistical tests
+
+#### Storer-Kim binomial exact test of two proportions for each SNP
+
+```{r, eval=F}
+unresponsive.SK <- PSGE.SK(unresponsive_counts,metadata,"unresponsive",2)
+write.csv(unresponsive.SK,"LB11xW4_unresponsiveSK.csv", row.names=F)
+
+responsive.SK <- PSGE.SK(responsive_counts,metadata,"responsive",2)
+write.csv(responsive.SK,"LB11xW4_responsiveSK.csv", row.names=F)
+```
+
+#### Fit GLIMMIX for each gene
+
+```{r, eval=F}
+unresponsive.GLIMMIX <- PSGE.GLIMMIX(unresponsive_counts,metadata,2)
+write.csv(unresponsive.GLIMMIX,"LB11xW4_unresponsiveGLIMMIX.csv", row.names=F)
+unresponsive.GLIMMIX <- unresponsive.GLIMMIX[,1:4]
+unresponsive.GLIMMIX <- unresponsive.GLIMMIX[!duplicated(unresponsive.GLIMMIX),]
+
+responsive.GLIMMIX <- PSGE.GLIMMIX(responsive_counts,metadata,2)
+write.csv(responsive.GLIMMIX,"LB11xW4_responsiveGLIMMIX.csv", row.names=F)
+responsive.GLIMMIX <- responsive.GLIMMIX[,1:4]
+responsive.GLIMMIX <- responsive.GLIMMIX[!duplicated(unresponsive.GLIMMIX),]
+```
+
+## Assess test results for each gene [`PSGE.analysis`]
+1) Split count matrices by cross and parent of origin for plotting
+2) Set up a data.frame to plot %p1 and %p2 for each SNP
+3) Join results of Storer-Kim tests
+4) Join results of GLIMMIX models
+5) Correct for multiple testing
+6) For each gene, check whether all SNPs are biased in the same direction
+7) Genes with parentXcross effects are flagged as unbiased
+
+```{r,eval=F}
+unresponsive.plot <- PSGE.analysis(unresponsive_counts,"unresponsive",metadata,
+                                   unresponsive.SK,unresponsive.GLIMMIX)
+write.csv(unresponsive.plot,"LB11xW4_unresponsive_PSGE.csv",row.names=F)
+
+responsive.plot <- PSGE.analysis(responsive_counts,"responsive",metadata,
+                                 responsive.SK,responsive.GLIMMIX)
+write.csv(responsive.plot,"LB11xW4_responsive_PSGE.csv",row.names=F)
+```
+
+### Plot PSGE by transcript
+
+1) Collapse SNPs to calculate p1 & p2 by transcript [`PSGE.collapse.avgExp`]
+2) Generate PSGE plot, averaging p1 & p2 by transcript [`PSGE.plot.tx`]
+3) Make center table [`triplot.plot`]
+
+#### Unresponsive
+
+```{r,eval=F}
+unresponsive.plot <- read.csv("LB11xW4_unresponsive_PSGE.csv")
+unresponsive.plot[is.na(unresponsive.plot$xbias),"xbias"] <- "NA"
+unresponsive.plot[is.na(unresponsive.plot$bias),"bias"] <- "NA"
+unresponsive.plot[is.na(unresponsive.plot$bias.plot),"bias.plot"] <- "NA"
+unresponsive.plot <- rbind(unresponsive.plot[unresponsive.plot$
+                                               bias.plot%in%c("NA"),],
+                      unresponsive.plot[unresponsive.plot$bias.plot%in%c(
+                        "mat", "Cross A", "Cross B", "pat"),])
+unresponsive.plot$bias.plot <- factor(unresponsive.plot$bias.plot,
+                                 levels = c("NA","mat", "Cross A", "Cross B", "pat"))
+
+unresponsive.collapse <- PSGE.collapse.avgExp(unresponsive.plot,
+                                              unresponsive_counts,
+                                              metadata,"unresponsive")
+g1.avgExp <- PSGE.plot.tx(unresponsive.collapse,"Unresponsive workers")
+```
+
+#### Responsive
+
+```{r, eval=F}
+responsive.plot <- read.csv("LB11xW4_responsive_PSGE.csv")
+responsive.plot[is.na(responsive.plot$xbias),"xbias"] <- "NA"
+responsive.plot[is.na(responsive.plot$bias),"bias"] <- "NA"
+responsive.plot[is.na(responsive.plot$bias.plot),"bias.plot"] <- "NA"
+responsive.plot <- rbind(responsive.plot[responsive.plot$bias.plot%in%c("NA"),],
+                      responsive.plot[responsive.plot$bias.plot%in%c(
+                        "mat", "Cross A", "Cross B", "pat"),])
+responsive.plot$bias.plot <- factor(responsive.plot$bias.plot,
+                                 levels = c("NA","mat", "Cross A", "Cross B", "pat"))
+
+responsive.collapse <- PSGE.collapse.avgExp(responsive.plot,responsive_counts,
+                                            metadata,"responsive")
+g2.avgExp <- PSGE.plot.tx(responsive.collapse,"Responsive workers")
+```
+
+#### Join results and generate final plot
+
+```{r, eval=F}
+allgenes <- read.table("Amel_HAv3.1_genes.bed",header=F)[,c(4)]
+triplot.avgExp <- triplot.plot(unresponsive.collapse,responsive.collapse,
+                               "Unresponsive","Responsive",allgenes)
+fig1.avgExp <- arrangeGrob(g1.avgExp, triplot.avgExp, 
+                           g2.avgExp, widths=c(5,2.5,5))
+ggsave(file="LB11xW4_avgExp.png", plot=fig1.avgExp, width=15, height=6)
+```
+
+```{r, echo=F, out.width="linewidth",fig.align="center"}
+knitr::include_graphics("LB11xW4_avgExp.png")
+```
+
+### Export PSGE gene lists [`export_PSGE_results`]
+
+```{r, eval=F}
+export_PSGE_results(unresponsive.plot,responsive.plot,"LB11xW4_PSGEs.csv")
+```
+
+# Y12xO20
+
+### Sample metadata
+
+```{r}
+metadata <- read.csv("metadata.csv")
+metadata <- metadata[metadata$block=="Y12xO20",]
+kbl(metadata) %>% kable_styling()
+```
+
+### Generate SNP:gene read coverage matrix
+
+#### Filter SNPs
+
+```{r, eval=F}
+filterlist <- read.csv("miRNA_tRNA_genes.csv",header=F)[,c(1)]
+SNPs <- filter_SNPs("Y12xO20_SNPs_for_analysis_sorted.bed",filterlist,2)
+write.table(SNPs,"Y12xO20_SNP_gene_overlaps.txt",sep="\t",quote=F,row.names=F)
+SNPs <- SNPs[,c(3,4)]
+```
+
+#### Combine coverage files to single matrix
+
+```{r,eval=F}
+SNP_counts <- make_ASE_counts_matrix("counts",metadata,2)
+write.csv(SNP_counts,"Y12xO20_SNP_gene_counts.csv")
+```
+
+### Normalize counts by library size
+
+```{r,eval=F}
+SNP_counts_normalized <- normalizeASReadCounts(SNP_counts[,1:24],metadata)
+write.csv(SNP_counts_normalized,"Y12xO20_SNP_gene_counts_normalized.csv")
+SNP_counts <- SNP_counts_normalized
+rm(SNP_counts_normalized)
+```
+
+### Process count matrices for each phenotype
+
+#### Split counts matrix by phenotype
+
+```{r, eval=F}
+unresponsive.IDs <- metadata[metadata$phenotype=="unresponsive","sample.id"]
+responsive.IDs <- metadata[metadata$phenotype=="responsive","sample.id"]
+
+unresponsive_counts <- SNP_counts[,names(SNP_counts)%in%unresponsive.IDs]
+responsive_counts <- SNP_counts[,names(SNP_counts)%in%responsive.IDs]
+```
+
+#### Filter low-count SNPs from count matrix
+
+```{r, eval=F}
+unresponsive_counts <- filter_counts(unresponsive_counts,metadata,9)
+write.csv(unresponsive_counts,"Y12xO20_unresponsive_counts.csv")
+responsive_counts <- filter_counts(responsive_counts,metadata,9)
+write.csv(responsive_counts,"Y12xO20_responsive_counts.csv")
+```
+
+### Conduct statistical tests
+
+#### Storer-Kim binomial exact test of two proportions for each SNP
+
+```{r, eval=F}
+unresponsive.SK <- PSGE.SK(unresponsive_counts,metadata,"unresponsive",2)
+write.csv(unresponsive.SK,"Y12xO20_unresponsiveSK.csv", row.names=F)
+
+responsive.SK <- PSGE.SK(responsive_counts,metadata,"responsive",2)
+write.csv(responsive.SK,"Y12xO20_responsiveSK.csv", row.names=F)
+```
+
+#### Fit GLIMMIX for each gene
+
+```{r, eval=F}
+unresponsive.GLIMMIX <- PSGE.GLIMMIX(unresponsive_counts,metadata,2)
+write.csv(unresponsive.GLIMMIX,"Y12xO20_unresponsiveGLIMMIX.csv", row.names=F)
+unresponsive.GLIMMIX <- unresponsive.GLIMMIX[,1:4]
+unresponsive.GLIMMIX <- unresponsive.GLIMMIX[!duplicated(unresponsive.GLIMMIX),]
+
+responsive.GLIMMIX <- PSGE.GLIMMIX(responsive_counts,metadata,2)
+write.csv(responsive.GLIMMIX,"Y12xO20_responsiveGLIMMIX.csv", row.names=F)
+responsive.GLIMMIX <- responsive.GLIMMIX[,1:4]
+responsive.GLIMMIX <- responsive.GLIMMIX[!duplicated(unresponsive.GLIMMIX),]
+```
+
+### Assess test results for each gene
+
+```{r,eval=F}
+unresponsive.plot <- PSGE.analysis(unresponsive_counts,"unresponsive",metadata,
+                                   unresponsive.SK,unresponsive.GLIMMIX)
+write.csv(unresponsive.plot,"Y12xO20_unresponsive_PSGE.csv",row.names=F)
+
+responsive.plot <- PSGE.analysis(responsive_counts,"responsive",metadata,
+                                 responsive.SK,responsive.GLIMMIX)
+write.csv(responsive.plot,"Y12xO20_responsive_PSGE.csv",row.names=F)
+```
+
+### Plot PSGE by transcript
+
+#### Unresponsive
+
+```{r,eval=F}
+unresponsive.plot <- read.csv("Y12xO20_unresponsive_PSGE.csv")
+unresponsive.plot[is.na(unresponsive.plot$xbias),"xbias"] <- "NA"
+unresponsive.plot[is.na(unresponsive.plot$bias),"bias"] <- "NA"
+unresponsive.plot[is.na(unresponsive.plot$bias.plot),"bias.plot"] <- "NA"
+unresponsive.plot <- rbind(unresponsive.plot[unresponsive.plot$
+                                               bias.plot%in%c("NA"),],
+                           unresponsive.plot[unresponsive.plot$bias.plot%in%c(
+                             "mat", "Cross A", "Cross B", "pat"),])
+unresponsive.plot$bias.plot <- factor(unresponsive.plot$bias.plot,
+                                      levels = c("NA","mat", "Cross A", "Cross B", "pat"))
+
+unresponsive.collapse <- PSGE.collapse.avgExp(unresponsive.plot,
+                                              unresponsive_counts,
+                                              metadata,"unresponsive")
+g1.avgExp <- PSGE.plot.tx(unresponsive.collapse,"Unresponsive workers")
+```
+
+#### Responsive
+
+```{r, eval=F}
+responsive.plot <- read.csv("Y12xO20_responsive_PSGE.csv")
+responsive.plot[is.na(responsive.plot$xbias),"xbias"] <- "NA"
+responsive.plot[is.na(responsive.plot$bias),"bias"] <- "NA"
+responsive.plot[is.na(responsive.plot$bias.plot),"bias.plot"] <- "NA"
+responsive.plot <- rbind(responsive.plot[responsive.plot$bias.plot%in%c("NA"),],
+                         responsive.plot[responsive.plot$bias.plot%in%c(
+                           "mat", "Cross A", "Cross B", "pat"),])
+responsive.plot$bias.plot <- factor(responsive.plot$bias.plot,
+                                    levels = c("NA","mat", "Cross A", "Cross B", "pat"))
+
+responsive.collapse <- PSGE.collapse.avgExp(responsive.plot,responsive_counts,
+                                            metadata,"responsive")
+g2.avgExp <- PSGE.plot.tx(responsive.collapse,"Responsive workers")
+```
+
+#### Join results and generate final plot
+
+```{r, eval=F}
+allgenes <- read.table("Amel_HAv3.1_genes.bed",header=F)[,c(4)]
+triplot.avgExp <- triplot.plot(unresponsive.collapse,responsive.collapse,
+                               "Unresponsive","Responsive",allgenes)
+fig1.avgExp <- arrangeGrob(g1.avgExp, triplot.avgExp, 
+                           g2.avgExp, widths=c(5,2.5,5))
+ggsave(file="Y12xO20_avgExp.png", plot=fig1.avgExp, width=15, height=6)
+```
+
+```{r, echo=F, out.width="linewidth",fig.align="center"}
+knitr::include_graphics("Y12xO20_avgExp.png")
+```
+
+### Export PSGE gene lists
+```{r, eval=F}
+export_PSGE_results(unresponsive.plot,responsive.plot,"Y12xO20_PSGEs.csv")
+```
+
+# B4xW36
+
+### Sample metadata
+
+```{r}
+metadata <- read.csv("metadata.csv")
+metadata <- metadata[metadata$block=="B4xW36",]
+kbl(metadata) %>% kable_styling()
+```
+
+### Generate SNP:gene read coverage matrix
+
+#### Filter SNPs
+
+```{r, eval=F}
+filterlist <- read.csv("miRNA_tRNA_genes.csv",header=F)[,c(1)]
+SNPs <- filter_SNPs("B4xW36_SNPs_for_analysis_sorted.bed",filterlist,2)
+write.table(SNPs,"B4xW36_SNP_gene_overlaps.txt",sep="\t",quote=F,row.names=F)
+SNPs <- SNPs[,c(3,4)]
+```
+
+#### Combine coverage files to single matrix
+
+```{r,eval=F}
+SNP_counts <- make_ASE_counts_matrix("counts",metadata,2)
+write.csv(SNP_counts,"B4xW36_SNP_gene_counts.csv")
+```
+
+### Normalize counts by library size
+
+```{r,eval=F}
+SNP_counts_normalized <- normalizeASReadCounts(SNP_counts[,1:24],metadata)
+write.csv(SNP_counts_normalized,"B4xW36_SNP_gene_counts_normalized.csv")
+SNP_counts <- SNP_counts_normalized
+rm(SNP_counts_normalized)
+```
+
+### Process count matrices for each phenotype
+
+#### Split counts matrix by phenotype
+
+```{r, eval=F}
+unresponsive.IDs <- metadata[metadata$phenotype=="unresponsive","sample.id"]
+responsive.IDs <- metadata[metadata$phenotype=="responsive","sample.id"]
+
+unresponsive_counts <- SNP_counts[,names(SNP_counts)%in%unresponsive.IDs]
+responsive_counts <- SNP_counts[,names(SNP_counts)%in%responsive.IDs]
+```
+
+#### Filter low-count SNPs from count matrix
+
+```{r, eval=F}
+unresponsive_counts <- filter_counts(unresponsive_counts,metadata,9)
+write.csv(unresponsive_counts,"B4xW36_unresponsive_counts.csv")
+responsive_counts <- filter_counts(responsive_counts,metadata,9)
+write.csv(responsive_counts,"B4xW36_responsive_counts.csv")
+```
+
+### Conduct statistical tests
+
+#### Storer-Kim binomial exact test of two proportions for each SNP
+
+```{r, eval=F}
+unresponsive.SK <- PSGE.SK(unresponsive_counts,metadata,"unresponsive",2)
+write.csv(unresponsive.SK,"B4xW36_unresponsiveSK.csv", row.names=F)
+
+responsive.SK <- PSGE.SK(responsive_counts,metadata,"responsive",2)
+write.csv(responsive.SK,"B4xW36_responsiveSK.csv", row.names=F)
+```
+
+#### Fit GLIMMIX for each gene
+
+```{r, eval=F}
+unresponsive.GLIMMIX <- PSGE.GLIMMIX(unresponsive_counts,metadata,2)
+write.csv(unresponsive.GLIMMIX,"B4xW36_unresponsiveGLIMMIX.csv", row.names=F)
+unresponsive.GLIMMIX <- unresponsive.GLIMMIX[,1:4]
+unresponsive.GLIMMIX <- unresponsive.GLIMMIX[!duplicated(unresponsive.GLIMMIX),]
+
+responsive.GLIMMIX <- PSGE.GLIMMIX(responsive_counts,metadata,2)
+write.csv(responsive.GLIMMIX,"B4xW36_responsiveGLIMMIX.csv", row.names=F)
+responsive.GLIMMIX <- responsive.GLIMMIX[,1:4]
+responsive.GLIMMIX <- responsive.GLIMMIX[!duplicated(unresponsive.GLIMMIX),]
+```
+
+### Assess test results for each gene
+
+```{r,eval=F}
+unresponsive.plot <- PSGE.analysis(unresponsive_counts,"unresponsive",metadata,
+                                   unresponsive.SK,unresponsive.GLIMMIX)
+write.csv(unresponsive.plot,"B4xW36_unresponsive_PSGE.csv",row.names=F)
+
+responsive.plot <- PSGE.analysis(responsive_counts,"responsive",metadata,
+                                 responsive.SK,responsive.GLIMMIX)
+write.csv(responsive.plot,"B4xW36_responsive_PSGE.csv",row.names=F)
+```
+
+### Plot PSGE by transcript
+
+#### Unresponsive
+
+```{r,eval=F}
+unresponsive.plot <- read.csv("B4xW36_unresponsive_PSGE.csv")
+unresponsive.plot[is.na(unresponsive.plot$xbias),"xbias"] <- "NA"
+unresponsive.plot[is.na(unresponsive.plot$bias),"bias"] <- "NA"
+unresponsive.plot[is.na(unresponsive.plot$bias.plot),"bias.plot"] <- "NA"
+unresponsive.plot <- rbind(unresponsive.plot[unresponsive.plot$
+                                               bias.plot%in%c("NA"),],
+                           unresponsive.plot[unresponsive.plot$bias.plot%in%c(
+                             "mat", "Cross A", "Cross B", "pat"),])
+unresponsive.plot$bias.plot <- factor(unresponsive.plot$bias.plot,
+                                      levels = c("NA","mat", "Cross A", "Cross B", "pat"))
+
+unresponsive.collapse <- PSGE.collapse.avgExp(unresponsive.plot,
+                                              unresponsive_counts,
+                                              metadata,"unresponsive")
+g1.avgExp <- PSGE.plot.tx(unresponsive.collapse,"Unresponsive workers")
+```
+
+#### Responsive
+
+```{r, eval=F}
+responsive.plot <- read.csv("B4xW36_responsive_PSGE.csv")
+responsive.plot[is.na(responsive.plot$xbias),"xbias"] <- "NA"
+responsive.plot[is.na(responsive.plot$bias),"bias"] <- "NA"
+responsive.plot[is.na(responsive.plot$bias.plot),"bias.plot"] <- "NA"
+responsive.plot <- rbind(responsive.plot[responsive.plot$bias.plot%in%c("NA"),],
+                         responsive.plot[responsive.plot$bias.plot%in%c(
+                           "mat", "Cross A", "Cross B", "pat"),])
+responsive.plot$bias.plot <- factor(responsive.plot$bias.plot,
+                                    levels = c("NA","mat", "Cross A", "Cross B", "pat"))
+
+responsive.collapse <- PSGE.collapse.avgExp(responsive.plot,responsive_counts,
+                                            metadata,"responsive")
+g2.avgExp <- PSGE.plot.tx(responsive.collapse,"Responsive workers")
+```
+
+#### Join results and generate final plot
+
+```{r, eval=F}
+allgenes <- read.table("Amel_HAv3.1_genes.bed",header=F)[,c(4)]
+triplot.avgExp <- triplot.plot(unresponsive.collapse,responsive.collapse,
+                               "Unresponsive","Responsive",allgenes)
+fig1.avgExp <- arrangeGrob(g1.avgExp, triplot.avgExp, 
+                           g2.avgExp, widths=c(5,2.5,5))
+ggsave(file="B4xW36_avgExp.png", plot=fig1.avgExp, width=15, height=6)
+```
+
+```{r, echo=F, out.width="linewidth",fig.align="center"}
+knitr::include_graphics("B4xW36_avgExp.png")
+```
+
+### Export PSGE gene lists
+```{r, eval=F}
+export_PSGE_results(unresponsive.plot,responsive.plot,"B4xW36_PSGEs.csv")
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
+
